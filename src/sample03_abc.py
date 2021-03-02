@@ -3,7 +3,9 @@ from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
 
+from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructField, StructType, StringType, IntegerType
@@ -32,7 +34,7 @@ gds_receipt = glueContext.create_dynamic_frame.from_options(
     connection_options = {'paths': ["s3://test-bucket/sns-receipt_data"]},
     format = "csv",
     format_options={"withHeader": True, "separator": ","},
-    transformation_ctx = "datasource0"
+    transformation_ctx = "gds_receipt"
 )
 
 print("=====================================")
@@ -90,5 +92,42 @@ df_amount_ABC = df_cumsum_ratio.withColumn(
 df_amount_ABC.show()
 
 # ランクごとの商品数を表示
-df_amount_ABC.groupBy('abc_rank').count().show()
+df_rank_item_count = df_amount_ABC.groupBy('abc_rank').count()
+df_rank_item_count.show()
 
+print("=====================================")
+print("S3にファイルを出力する")
+print("=====================================")
+
+# 複数ファイル出力を一つにする場合
+df_rank_item_count = df_rank_item_count.coalesce(1)
+
+# PySparkのDataFrameをGlueのDataFrameに変換
+gdf_rank_item_count = DynamicFrame.fromDF(df_rank_item_count, glueContext, 'gdf_rank_item_count')
+gdf_rank_item_count.show()
+
+
+# s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
+out_df_rank_item_count = glueContext.write_dynamic_frame.from_options(
+    frame=gdf_rank_item_count,
+    connection_type='s3',
+    connection_options={
+        'path': 's3://test-bucket'
+    },
+    format='csv',
+    transformation_ctx = "out_df_rank_item_count",
+)
+
+# writeでも出力は出来たが、やはりバケット直下のみ
+# out_df_rank_item_count = gdf_rank_item_count.write(
+#     connection_type='s3',
+#     connection_options={'path': 's3://test-bucket'},
+#     format="csv",
+#     # format_options,
+#     # accumulator_size
+#     )
+
+print("=====================================")
+print("job commit")
+print("=====================================")
+job.commit()

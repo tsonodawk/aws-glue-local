@@ -116,9 +116,6 @@ df_numeric.select(["visit_date", "visit_count"]).groupby("visit_date").sum().sho
 # df_join_drop.select(["visit_date", "visit_count"]).groupBy("visit_date").agg(sum()).show()
 
 
-
-
-
 print("=====================================")
 print("test moromoro")
 print("=====================================")
