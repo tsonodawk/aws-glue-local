@@ -12,7 +12,7 @@ from pyspark.sql.types import StructField, StructType, StringType, IntegerType, 
 from pyspark.sql.window import Window
 from pyspark.sql import DataFrame
 from pyspark.sql import SparkSession
-
+from pyspark.sql.functions import col
 
 ## @params: [JOB_NAME]
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
@@ -23,6 +23,30 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
+
+def s3_write_spark_dataframe_single_file(spark_data_frame, s3_path):
+    """ S3にファイルを出力する
+    args:
+        spark_data_frame: spark形式のDataFrame
+        s3_path: 出力先S3のフルパス
+    return:
+    """
+    # 複数ファイル出力を一つにする
+    sdf_single = spark_data_frame.coalesce(1)
+    # PySparkのDataFrameをGlueのDataFrameに変換
+    gdf_single = DynamicFrame.fromDF(sdf_single, glueContext, 'gdf_single')
+
+    # S3に出力
+    s3_write_dynamic_frame = glueContext.write_dynamic_frame.from_options(
+        frame=gdf_single,
+        connection_type='s3',
+        connection_options={
+            'path': s3_path
+        },
+        format='csv',
+        transformation_ctx = "s3_write_dynamic_frame ",
+    )
+    return s3_write_dynamic_frame
 
 print("=====================================")
 print("Start S3 DataRead")
@@ -40,9 +64,6 @@ print("=====================================")
 #     )
 #
 #######
-
-
-# SparkDataFrame形式でS3からファイルを読み込んでしまう
 
 journal_schema = StructType([
     StructField("cpcd2", IntegerType(), True),
@@ -80,68 +101,28 @@ journal_schema = StructType([
     StructField("num_org", StringType(), True),
 ])
 
-sdf_journal_all = spark.read.csv(
-    "s3://mekiki-data-bucket/mekiki-data/input-output/journal-data",
-    header=False,
-    encoding='utf-8',
-    schema=journal_schema)
-
-# sdf_journal_all.show()
-
-print("=====================================")
-print("filter category")
-print("=====================================")
-# 本来は cate1 = 11 and cate2 = 3108 and cate3 = 3357 
-# TODO: categoryを引数 or パラメータ化の検討
-
-sdf_journal_filter = sdf_journal_all.filter(
-    (sdf_journal_all.cate1 == "000011")
-    & (sdf_journal_all.cate2 == "000000")
-    & (sdf_journal_all.cate3 == "000000")
+# MEMO: 取り込みpath確認
+sdf_journal_filter_data = spark.read.csv(
+    's3://journal-filter-data',
+    header=True, encoding='utf-8', schema=journal_schema
     )
 
 
-print("=====================================")
-print("Start Write S3")
-print("=====================================")
-# 複数ファイル出力を一つにする場合
-sdf_journal_filter = sdf_journal_filter.coalesce(1)
+# MEMO: 取り込みpath確認
+sdf_sales_itmcd_start_data  = spark.read.csv(
+    's3://sales-itmcd-start-ymd',
+    header=True, encoding='utf-8'
+    )
 
-# sdf_journal_filter.write.mode('overwrite').csv(
-#     "s3://journal-filter-data"
-#     )
 
-# sdf_journal_filter.write.mode('overwrite').csv(
-#     "s3://mekiki-data-bucket/mekiki-data/input-output/journarl-filter-data",
-#     header=True
-#     )
-# sdf_journal_filter.show()
-
-# sdf_journal_filter.write.mode('append').csv(
-#     "s3://mekiki-data-bucket/"
-# )
-
-# sdf_journal_filter.write.mode('overwrite').parquet(
-#     "s3://mekiki-data-bucket/mekiki-data/input-output/journarl-filter-data/"
-#     )
-
-# PySparkのDataFrameをGlueのDataFrameに変換
-gdf_journal_filter = DynamicFrame.fromDF(sdf_journal_filter, glueContext, 'gdf_journal_filter')
-# gdf_journal_filter.show()
-
-# s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
-# 本番では他ディレクトリ配下に作成可能
-out_gdf_journal_filter = glueContext.write_dynamic_frame.from_options(
-    frame=gdf_journal_filter,
-    connection_type='s3',
-    connection_options={
-        'path': 's3://journal-filter-data'
-    },
-    format='csv',
-    transformation_ctx = "out_gdf_journal_filter ",
-)
 
 print("=====================================")
-print("job commit")
+print("Start S3 DataRead")
 print("=====================================")
-job.commit()
+# 顧客IDが含まれるデータの抽出
+# ますはcstidを使用
+sdf_sales_filter_in_customerid = sdf_journal_filter_data.filter(
+    (sdf_journal_filter_data.cstid > 0)
+    & (sdf_journal_filter_data.Ymd >= "2020-05-23")
+    )
+
