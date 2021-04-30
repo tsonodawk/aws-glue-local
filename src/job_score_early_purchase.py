@@ -24,6 +24,30 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 
+def s3_write_spark_dataframe_single_file(spark_data_frame, s3_path):
+    """ S3にファイルを出力する
+    args:
+        spark_data_frame: spark形式のDataFrame
+        s3_path: 出力先S3のフルパス
+    return:
+    """
+    # 複数ファイル出力を一つにする
+    sdf_single = spark_data_frame.coalesce(1)
+    # PySparkのDataFrameをGlueのDataFrameに変換
+    gdf_single = DynamicFrame.fromDF(sdf_single, glueContext, 'gdf_single')
+
+    # S3に出力
+    s3_write_dynamic_frame = glueContext.write_dynamic_frame.from_options(
+        frame=gdf_single,
+        connection_type='s3',
+        connection_options={
+            'path': s3_path
+        },
+        format='csv',
+        transformation_ctx = "s3_write_dynamic_frame ",
+    )
+    return s3_write_dynamic_frame
+
 print("=====================================")
 print("Start S3 DataRead")
 print("=====================================")
@@ -40,7 +64,6 @@ print("=====================================")
 #     )
 #
 #######
-
 def journal_fields():
     fields_list = [
         StructField("cpcd2", IntegerType(), True),
@@ -78,7 +101,6 @@ def journal_fields():
         StructField("num_org", StringType(), True),
         ]
     return fields_list
-
 def item_fields():
     fields_list = [
         StructField("itmid", StringType(), True),
@@ -105,7 +127,30 @@ def item_fields():
 
     return fields_list
 
-# SparkDataFrame形式でS3からファイルを読み込んでしまう
+
+def popular_items_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("cate1", StringType(), True),
+        StructField("cate2", StringType(), True),
+        StructField("cate3", StringType(), True),
+        StructField("cate4", StringType(), True),
+        StructField("cate5", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("itmnm", StringType(), True),
+        StructField("sales_start_day", DateType(), True),
+    ]
+
+    return fields_list
+
+
+def score_master_early_purchase_fields():
+    fields_list = [
+        StructField("days_later_buy", IntegerType(), True),
+        StructField("early_purchase_score", IntegerType(), True),
+    ]
+
+    return fields_list
 
 # ==============================
 # parameterファイル読み込み
@@ -123,92 +168,88 @@ param_month_later = sdf_parameter.first()['month_later']
 # ==============================
 # データファイル読み込み
 # ==============================
-# journalファイル読み込み
+# journal_filter読み込み
 journal_schema = StructType(journal_fields())
-journal_dir = "s3://mekiki-data-bucket/mekiki-data/input-output/journal-data"
-sdf_journal_data = spark.read.csv(journal_dir, header=False, encoding='utf-8', schema=journal_schema)
+journal_dir = 's3://journal-filter-data/'
+sdf_journal_filter_data = spark.read.csv(journal_dir, header=True, encoding='utf-8', schema=journal_schema)
 
-# item読み込み
-item_schema = StructType(item_fields())
-item_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/item-master/'
-sdf_item_master = spark.read.csv(item_dir, header=False, encoding='utf-8', schema=item_schema)
+# 新商品リストを読み込み
+popular_items_schema = StructType(popular_items_fields())
+pupular_items_dir = 's3://new-release-items/'
+sdf_popular_items = spark.read.csv(pupular_items_dir, header=True, encoding='utf-8', schema=popular_items_schema)
+
+# sdf_popular_items.show()
+
+# # 早期購入スコア
+# score_master_early_purchase_schema = StructType(score_master_early_purchase_fields())
+# master_early_purchase_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/score-master-early-purchase/'
+# sdf_score_master_early_purchase = spark.read.csv(master_early_purchase_dir, header=True, encoding='utf-8', schema=score_master_early_purchase_schema )
+
+# sdf_score_master_early_purchase.show()
 
 print("=====================================")
-print("filter category")
+print("exec precess")
 print("=====================================")
-# journalにitem_masterをjoin
-# 特定フィルターにしぼる
-sdf_journal_filter_data = sdf_journal_data.join(
-    sdf_item_master,
-    sdf_journal_data.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
+# 遡り日数の取得
+# 開始日・終了日をセット(pysparkのfunctionを使用)
+sdf_parameter_add = sdf_parameter.select(
+    func.add_months(sdf_parameter.reference_date, -int(param_month_ago)).alias('sales_start_date'),
+)
+
+sales_start_date = sdf_parameter_add.first()['sales_start_date']
+# print(sales_start_date)
+
+# 指定期間以上の日付で、顧客IDが含まれるデータの抽出
+sdf_sales_filter_in_customerid = sdf_journal_filter_data.filter(
+    (sdf_journal_filter_data.cadid != "000000000000000000")
+    & (sdf_journal_filter_data.ymd >= sales_start_date)
+    )
+# sdf_sales_filter_in_customerid .show()
+
+# 顧客IDが含まれるデータで、対象新商品のみ抽出し、店舗・商品・顧客毎に最小日付（最初に買った日）を出力する
+sdf_sales_customer_buy_min_ymd = sdf_sales_filter_in_customerid.alias('df_cus').join(
+    sdf_popular_items.alias('df_pop'),
+    [
+        # target shop and itmcd
+        col('df_cus.shop') == col('df_pop.shop'),
+        col('df_cus.itmcd') == col('df_pop.itmcd')
+    ],
     'inner'
-).select(
-    sdf_journal_data.cpcd2,
-    sdf_journal_data.shop,
-    sdf_journal_data.ymd,
-    sdf_journal_data.hm,
-    sdf_journal_data.reg,
-    sdf_journal_data.num,
-    sdf_journal_data.seq,
-    sdf_journal_data.dtype,
-    sdf_journal_data.itmcd,
-    # >> item cate
-    sdf_item_master.cate1,
-    sdf_item_master.cate2,
-    sdf_item_master.cate3,
-    sdf_item_master.cate4,
-    sdf_item_master.cate5,
-    # << item cate
-    sdf_journal_data.qty,
-    sdf_journal_data.amt,
-    sdf_journal_data.prf,
-    sdf_journal_data.type,
-    sdf_journal_data.pay,
-    sdf_journal_data.cadid,
-    sdf_journal_data.cid,
-    sdf_journal_data.cstid,
-    sdf_journal_data.itmid,
-    sdf_journal_data.bgnno,
-    sdf_journal_data.bgntp,
-    sdf_journal_data.bgnid,
-    sdf_journal_data.itmcd_org,
-    sdf_journal_data.opt01,
-    sdf_journal_data.opt02,
-    sdf_journal_data.opt03,
-    sdf_journal_data.opt04,
-    sdf_journal_data.opt05,
-    sdf_journal_data.num_org,
-).filter(
-    (sdf_item_master.cate1 == param_cate1)
-    & (sdf_item_master.cate2 == param_cate2)
-    & (sdf_item_master.cate3 == param_cate3)
+).groupBy(
+    'df_cus.shop', 'df_cus.itmcd', 'df_cus.cadid', 'df_pop.sales_start_day'
+).agg(
+    func.min('df_cus.ymd').alias('buy_min_ymd')
 )
 
-print("=====================================")
-print("Start Write S3")
-print("=====================================")
+# sdf_sales_customer_buy_min_ymd.show()
 
-# 複数ファイル出力を一つにする場合
-sdf_journal_filter_data = sdf_journal_filter_data.coalesce(1)
+# 販売開始日との日数差を出す
+sdf_days_later_buy = sdf_sales_customer_buy_min_ymd.alias('df1').withColumn(
+    'days_later_buy',
+    func.datediff(col('df1.buy_min_ymd'), col('df1.sales_start_day'))
+    # func.datediff(col('min_ymd'), col('buy_min_ymd'))
+    # (col('min_ymd') - col('buy_min_ymd')).days
+    ).orderBy(
+        'days_later_buy'
+        )
 
-# sdf_journal_filter_data.show()
+# sdf_days_later_buy.show()
 
-# PySparkのDataFrameをGlueのDataFrameに変換
-gdf_write_data = DynamicFrame.fromDF(sdf_journal_filter_data, glueContext, 'gdf_journal_filter_data')
-
-# s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
-# 本番では他ディレクトリ配下に作成可能
-out_gdf = glueContext.write_dynamic_frame.from_options(
-    frame=gdf_write_data,
-    connection_type='s3',
-    connection_options={
-        'path': 's3://journal-filter-data'
-    },
-    format='csv',
-    transformation_ctx = "out_gdf",
+# スコアの計算(1/n で逆算値を使用する)
+sdf_score_early_purchase = sdf_days_later_buy.withColumn(
+    'early_purchase_score', 1 / (sdf_days_later_buy.days_later_buy + 1)
 )
+
+# sdf_score_early_purchase.show()
+
+# 出力
+out_gdf_score_early_purchase = s3_write_spark_dataframe_single_file(
+    sdf_score_early_purchase,
+    's3://score-early-purchase'
+    )
 
 print("=====================================")
 print("job commit")
 print("=====================================")
 job.commit()
+

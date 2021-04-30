@@ -27,19 +27,6 @@ job.init(args['JOB_NAME'], args)
 print("=====================================")
 print("Start S3 DataRead")
 print("=====================================")
-#######
-# 本番ではGlueテーブルから読み込む
-# ↓
-# .toDF() でSparkDataFrameへ変換を想定(データ型はGlueのテーブル型になってると思う)
-#
-# GlueテーブルからDataFrameの作成例：
-# DataSource0 = glueContext.create_dynamic_frame.from_catalog(
-#     database = "glue-sample-db",
-#     table_name = "sns_sales_receipt_data",
-#     transformation_ctx = "DataSource0"
-#     )
-#
-#######
 
 def journal_fields():
     fields_list = [
@@ -105,96 +92,45 @@ def item_fields():
 
     return fields_list
 
-# SparkDataFrame形式でS3からファイルを読み込んでしまう
-
 # ==============================
 # parameterファイル読み込み
 # ==============================
-file_path = 's3://mekiki-data-bucket/mekiki-data/input-output/parameter-master/'
-sdf_parameter = spark.read.csv(file_path, header=True)
+# file_path = 's3://mekiki-data-bucket/mekiki-data/input-output/parameter-master/'
+# sdf_parameter = spark.read.csv(file_path, header=True)
 
-param_cate1 = sdf_parameter.first()['cate1']
-param_cate2 = sdf_parameter.first()['cate2']
-param_cate3 = sdf_parameter.first()['cate3']
-param_reference_date = sdf_parameter.first()['reference_date']
-param_month_ago = sdf_parameter.first()['month_ago']
-param_month_later = sdf_parameter.first()['month_later']
+# param_cate1 = sdf_parameter.first()['cate1']
+# param_cate2 = sdf_parameter.first()['cate2']
+# param_cate3 = sdf_parameter.first()['cate3']
+# param_reference_date = sdf_parameter.first()['reference_date']
+# param_month_ago = sdf_parameter.first()['month_ago']
+# param_month_later = sdf_parameter.first()['month_later']
 
 # ==============================
 # データファイル読み込み
 # ==============================
-# journalファイル読み込み
+# journal_fileter読み込み
+
 journal_schema = StructType(journal_fields())
-journal_dir = "s3://mekiki-data-bucket/mekiki-data/input-output/journal-data"
-sdf_journal_data = spark.read.csv(journal_dir, header=False, encoding='utf-8', schema=journal_schema)
+journal_dir = 's3://journal-filter-data/'
+sdf_journal_filter_data = spark.read.csv(journal_dir, header=True, encoding='utf-8', schema=journal_schema)
 
-# item読み込み
-item_schema = StructType(item_fields())
-item_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/item-master/'
-sdf_item_master = spark.read.csv(item_dir, header=False, encoding='utf-8', schema=item_schema)
 
 print("=====================================")
-print("filter category")
+print("exec process")
 print("=====================================")
-# journalにitem_masterをjoin
-# 特定フィルターにしぼる
-sdf_journal_filter_data = sdf_journal_data.join(
-    sdf_item_master,
-    sdf_journal_data.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
-    'inner'
-).select(
-    sdf_journal_data.cpcd2,
-    sdf_journal_data.shop,
-    sdf_journal_data.ymd,
-    sdf_journal_data.hm,
-    sdf_journal_data.reg,
-    sdf_journal_data.num,
-    sdf_journal_data.seq,
-    sdf_journal_data.dtype,
-    sdf_journal_data.itmcd,
-    # >> item cate
-    sdf_item_master.cate1,
-    sdf_item_master.cate2,
-    sdf_item_master.cate3,
-    sdf_item_master.cate4,
-    sdf_item_master.cate5,
-    # << item cate
-    sdf_journal_data.qty,
-    sdf_journal_data.amt,
-    sdf_journal_data.prf,
-    sdf_journal_data.type,
-    sdf_journal_data.pay,
-    sdf_journal_data.cadid,
-    sdf_journal_data.cid,
-    sdf_journal_data.cstid,
-    sdf_journal_data.itmid,
-    sdf_journal_data.bgnno,
-    sdf_journal_data.bgntp,
-    sdf_journal_data.bgnid,
-    sdf_journal_data.itmcd_org,
-    sdf_journal_data.opt01,
-    sdf_journal_data.opt02,
-    sdf_journal_data.opt03,
-    sdf_journal_data.opt04,
-    sdf_journal_data.opt05,
-    sdf_journal_data.num_org,
-).filter(
-    (sdf_item_master.cate1 == param_cate1)
-    & (sdf_item_master.cate2 == param_cate2)
-    & (sdf_item_master.cate3 == param_cate3)
-)
+
+# 全期間を使用して対処商品の最小販売日付を作成
+sdf_sales_start_day = sdf_journal_filter_data.groupBy(
+        'shop', 'itmcd'
+    ).agg(
+        func.min('ymd').alias('sales_start_day')
+    )
 
 print("=====================================")
 print("Start Write S3")
 print("=====================================")
-
-# 複数ファイル出力を一つにする場合
-sdf_journal_filter_data = sdf_journal_filter_data.coalesce(1)
-
-# sdf_journal_filter_data.show()
-
 # PySparkのDataFrameをGlueのDataFrameに変換
-gdf_write_data = DynamicFrame.fromDF(sdf_journal_filter_data, glueContext, 'gdf_journal_filter_data')
+gdf_write_data = DynamicFrame.fromDF(sdf_sales_start_day.coalesce(1), glueContext, 'gdf_write_data')
 
 # s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
 # 本番では他ディレクトリ配下に作成可能
@@ -202,7 +138,7 @@ out_gdf = glueContext.write_dynamic_frame.from_options(
     frame=gdf_write_data,
     connection_type='s3',
     connection_options={
-        'path': 's3://journal-filter-data'
+        'path': 's3://sales-start-day'
     },
     format='csv',
     transformation_ctx = "out_gdf",

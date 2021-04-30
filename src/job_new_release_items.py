@@ -24,6 +24,31 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 
+def s3_write_spark_dataframe_single_file(spark_data_frame, s3_path):
+    """ S3にファイルを出力する
+    args:
+        spark_data_frame: spark形式のDataFrame
+        s3_path: 出力先S3のフルパス
+    return:
+    """
+    # 複数ファイル出力を一つにする
+    sdf_single = spark_data_frame.coalesce(1)
+    # PySparkのDataFrameをGlueのDataFrameに変換
+    gdf_single = DynamicFrame.fromDF(sdf_single, glueContext, 'gdf_single')
+
+    # S3に出力
+    s3_write_dynamic_frame = glueContext.write_dynamic_frame.from_options(
+        frame=gdf_single,
+        connection_type='s3',
+        connection_options={
+            'path': s3_path
+        },
+        format='csv',
+        transformation_ctx = "s3_write_dynamic_frame ",
+    )
+    return s3_write_dynamic_frame
+
+
 print("=====================================")
 print("Start S3 DataRead")
 print("=====================================")
@@ -105,7 +130,15 @@ def item_fields():
 
     return fields_list
 
-# SparkDataFrame形式でS3からファイルを読み込んでしまう
+
+def stales_start_day_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("sales_start_day", DateType(), True),
+    ]
+
+    return fields_list
 
 # ==============================
 # parameterファイル読み込み
@@ -123,90 +156,109 @@ param_month_later = sdf_parameter.first()['month_later']
 # ==============================
 # データファイル読み込み
 # ==============================
-# journalファイル読み込み
 journal_schema = StructType(journal_fields())
-journal_dir = "s3://mekiki-data-bucket/mekiki-data/input-output/journal-data"
-sdf_journal_data = spark.read.csv(journal_dir, header=False, encoding='utf-8', schema=journal_schema)
+journal_dir = 's3://journal-filter-data/'
+sdf_journal_filter_data = spark.read.csv(journal_dir, header=True, encoding='utf-8', schema=journal_schema)
+# sdf_journal_filter_data.show()
 
-# item読み込み
 item_schema = StructType(item_fields())
 item_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/item-master/'
 sdf_item_master = spark.read.csv(item_dir, header=False, encoding='utf-8', schema=item_schema)
+# sdf_item_master.show()
+
+sales_start_schema = StructType(stales_start_day_fields())
+sales_start_dir = 's3://sales-start-day/'
+sdf_sales_start_day = spark.read.csv(sales_start_dir, header=True, encoding='utf-8', schema=sales_start_schema)
+
 
 print("=====================================")
-print("filter category")
+print("exec precess")
 print("=====================================")
-# journalにitem_masterをjoin
-# 特定フィルターにしぼる
-sdf_journal_filter_data = sdf_journal_data.join(
-    sdf_item_master,
-    sdf_journal_data.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
+# ==============================
+# 販売がある商品コード一覧を作成
+# create a list of itmcd with sales
+# ==============================
+# 終了日をセット(pysparkのfunctionを使用)
+# 基準日に月を加算し、対象付きの最終日付をセット
+sdf_parameter_add = sdf_parameter.select(
+    func.add_months(sdf_parameter.reference_date, int(param_month_later)).alias('end_date'),
+)
+
+# sdf_parameter_add.show()
+
+start_date = param_reference_date
+# print(start_date)
+end_date = sdf_parameter_add.first()['end_date']
+# print(end_date)
+
+# ==============================
+# 指定期間で、販売がある店舗・商品コード一覧を作成
+# create a list of itmcd with sales
+# ==============================
+sdf_sales_shop_itmcd = sdf_journal_filter_data.filter(
+    (sdf_journal_filter_data.ymd >= start_date)
+    & (sdf_journal_filter_data.ymd < end_date)
+    & (sdf_journal_filter_data.qty > 0)
+).select('shop', 'itmcd').distinct()
+
+# 出力
+out_gdf_sales_itmcd_start_ymd = s3_write_spark_dataframe_single_file(
+    sdf_sales_shop_itmcd,
+    's3://sales-shop-itmcd'
+    )
+
+# ==============================
+# 指定期間以降で販売された（だろう）商品と販売開始日
+# =============================
+# 開始日・終了日をセット(pysparkのfunctionを使用)
+sdf_parameter_add = sdf_parameter.select(
+    func.add_months(sdf_parameter.reference_date, -int(param_month_ago)).alias('sales_start_date'),
+)
+
+sales_start_date = sdf_parameter_add.first()['sales_start_date']
+# print(sales_start_date)
+
+sdf_sales_start_day_filter = sdf_sales_start_day.filter(
+    sdf_sales_start_day.sales_start_day >= sales_start_date
+)
+
+# 販売がある商品に、新商品（想定）の商品で絞り込んで販売開始日を付与する
+sdf_new_release_items = sdf_sales_shop_itmcd.join(
+    sdf_sales_start_day_filter,
+    [
+        sdf_sales_shop_itmcd.shop == sdf_sales_start_day_filter.shop,
+        sdf_sales_shop_itmcd.itmcd == sdf_sales_start_day_filter.itmcd
+    ],
     'inner'
 ).select(
-    sdf_journal_data.cpcd2,
-    sdf_journal_data.shop,
-    sdf_journal_data.ymd,
-    sdf_journal_data.hm,
-    sdf_journal_data.reg,
-    sdf_journal_data.num,
-    sdf_journal_data.seq,
-    sdf_journal_data.dtype,
-    sdf_journal_data.itmcd,
-    # >> item cate
+    sdf_sales_shop_itmcd['*'],
+    sdf_sales_start_day_filter.sales_start_day
+)
+
+# sdf_new_release_items.show()
+
+# 商品マスタの情報を付与する
+sdf_new_release_items_join_master = sdf_new_release_items.join(
+    sdf_item_master,
+    sdf_new_release_items.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
+    "inner"
+).select(
+    sdf_new_release_items.shop,
     sdf_item_master.cate1,
     sdf_item_master.cate2,
     sdf_item_master.cate3,
     sdf_item_master.cate4,
     sdf_item_master.cate5,
-    # << item cate
-    sdf_journal_data.qty,
-    sdf_journal_data.amt,
-    sdf_journal_data.prf,
-    sdf_journal_data.type,
-    sdf_journal_data.pay,
-    sdf_journal_data.cadid,
-    sdf_journal_data.cid,
-    sdf_journal_data.cstid,
-    sdf_journal_data.itmid,
-    sdf_journal_data.bgnno,
-    sdf_journal_data.bgntp,
-    sdf_journal_data.bgnid,
-    sdf_journal_data.itmcd_org,
-    sdf_journal_data.opt01,
-    sdf_journal_data.opt02,
-    sdf_journal_data.opt03,
-    sdf_journal_data.opt04,
-    sdf_journal_data.opt05,
-    sdf_journal_data.num_org,
-).filter(
-    (sdf_item_master.cate1 == param_cate1)
-    & (sdf_item_master.cate2 == param_cate2)
-    & (sdf_item_master.cate3 == param_cate3)
+    sdf_new_release_items.itmcd,
+    sdf_item_master.itmnm,
+    sdf_new_release_items.sales_start_day,
 )
 
-print("=====================================")
-print("Start Write S3")
-print("=====================================")
-
-# 複数ファイル出力を一つにする場合
-sdf_journal_filter_data = sdf_journal_filter_data.coalesce(1)
-
-# sdf_journal_filter_data.show()
-
-# PySparkのDataFrameをGlueのDataFrameに変換
-gdf_write_data = DynamicFrame.fromDF(sdf_journal_filter_data, glueContext, 'gdf_journal_filter_data')
-
-# s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
-# 本番では他ディレクトリ配下に作成可能
-out_gdf = glueContext.write_dynamic_frame.from_options(
-    frame=gdf_write_data,
-    connection_type='s3',
-    connection_options={
-        'path': 's3://journal-filter-data'
-    },
-    format='csv',
-    transformation_ctx = "out_gdf",
-)
+# 出力
+out_gdf_sales_itmcd_start_ymd = s3_write_spark_dataframe_single_file(
+    sdf_new_release_items_join_master,
+    's3://new-release-items'
+    )
 
 print("=====================================")
 print("job commit")
