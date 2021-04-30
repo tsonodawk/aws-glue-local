@@ -9,12 +9,19 @@ echo "========================"
 aws s3 mb s3://test-bucket ${endpoint_profile}
 aws s3 mb s3://aws-glue-local-test-bucket ${endpoint_profile}
 aws s3 mb s3://dcom-bucket ${endpoint_profile}
-aws s3 mb s3://mekiki-data-bucket ${endpoint_profile}
 
+# mekiki
+aws s3 mb s3://mekiki-data-bucket ${endpoint_profile}
 aws s3 mb s3://journal-filter-data ${endpoint_profile}
-aws s3 mb s3://sales-itmcd ${endpoint_profile}
-aws s3 mb s3://sales-itmcd-start-ymd ${endpoint_profile}
-aws s3 mb s3://score_early_purchase ${endpoint_profile}
+aws s3 mb s3://visit_count_shop_ymd ${endpoint_profile}
+aws s3 mb s3://new-release-items ${endpoint_profile}
+aws s3 mb s3://popular-amount-abc ${endpoint_profile}
+aws s3 mb s3://popular-quantity-abc ${endpoint_profile}
+aws s3 mb s3://popular-items ${endpoint_profile}
+aws s3 mb s3://sales-shop-itmcd ${endpoint_profile}
+aws s3 mb s3://sales-start-day ${endpoint_profile}
+aws s3 mb s3://score-early-purchase ${endpoint_profile}
+
 
 # データコピー
 echo "========================"
@@ -30,7 +37,17 @@ datadir=/Users/flat9th/workspace/目利きデータ/data
 aws s3 cp ${datadir}/journal_0536_2006.csv s3://dcom-bucket/yamanaka_journal_data/ ${endpoint_profile}
 
 # 実データ
-aws s3 cp ${datadir}/journal_0536_2006.csv s3://mekiki-data-bucket/mekiki-data/input-output/journal-data/ ${endpoint_profile}
+aws s3 cp ${datadir}/journal_0676_2006_filter.csv s3://mekiki-data-bucket/mekiki-data/input-output/journal-data/ ${endpoint_profile}
+aws s3 cp ${datadir}/journal_0683_2006_filter.csv s3://mekiki-data-bucket/mekiki-data/input-output/journal-data/ ${endpoint_profile}
+aws s3 cp ${datadir}/item_filter.csv s3://mekiki-data-bucket/mekiki-data/input-output/item-master/ ${endpoint_profile}
+aws s3 cp ${datadir}/category.csv s3://mekiki-data-bucket/mekiki-data/input-output/category-master/ ${endpoint_profile}
+
+
+datadir=/Users/flat9th/GitRepos/github-tsonodawk/local-dockers/pyspark_jupyter/data
+aws s3 cp ${datadir}/parameter-master/parameter.csv s3://mekiki-data-bucket/mekiki-data/input-output/parameter-master/ ${endpoint_profile}
+# score_masterは未使用
+# aws s3 cp ${datadir}/score_master_early_purchase/score_master_early_purchase.csv s3://mekiki-data-bucket/mekiki-data/input-output/score-master-early-purchase/ ${endpoint_profile}
+aws s3 cp ${datadir}/journal-filter-data/*.csv s3://mekiki-data-bucket/mekiki-data/input-output/jounal-filter-data/ ${endpoint_profile}
 
 
 # dynamodbテーブル作成・データ投入

@@ -48,24 +48,9 @@ def s3_write_spark_dataframe_single_file(spark_data_frame, s3_path):
     )
     return s3_write_dynamic_frame
 
-
 print("=====================================")
 print("Start S3 DataRead")
 print("=====================================")
-#######
-# 本番ではGlueテーブルから読み込む
-# ↓
-# .toDF() でSparkDataFrameへ変換を想定(データ型はGlueのテーブル型になってると思う)
-#
-# GlueテーブルからDataFrameの作成例：
-# DataSource0 = glueContext.create_dynamic_frame.from_catalog(
-#     database = "glue-sample-db",
-#     table_name = "sns_sales_receipt_data",
-#     transformation_ctx = "DataSource0"
-#     )
-#
-#######
-
 def journal_fields():
     fields_list = [
         StructField("cpcd2", IntegerType(), True),
@@ -130,11 +115,25 @@ def item_fields():
 
     return fields_list
 
-
 def stales_start_day_fields():
     fields_list = [
         StructField("shop", StringType(), True),
         StructField("itmcd", StringType(), True),
+        StructField("sales_start_day", DateType(), True),
+    ]
+
+    return fields_list
+
+def new_release_items_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("cate1", StringType(), True),
+        StructField("cate2", StringType(), True),
+        StructField("cate3", StringType(), True),
+        StructField("cate4", StringType(), True),
+        StructField("cate5", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("itmnm", StringType(), True),
         StructField("sales_start_day", DateType(), True),
     ]
 
@@ -153,114 +152,144 @@ param_reference_date = sdf_parameter.first()['reference_date']
 param_month_ago = sdf_parameter.first()['month_ago']
 param_month_later = sdf_parameter.first()['month_later']
 
+param_abc_s = sdf_parameter.first()['abc_s']
+param_abc_a = sdf_parameter.first()['abc_a']
+param_abc_b = sdf_parameter.first()['abc_b']
+param_abc_c = sdf_parameter.first()['abc_c']
+
 # ==============================
 # データファイル読み込み
 # ==============================
+# journal
 journal_schema = StructType(journal_fields())
 journal_dir = 's3://journal-filter-data/'
 sdf_journal_filter_data = spark.read.csv(journal_dir, header=True, encoding='utf-8', schema=journal_schema)
 # sdf_journal_filter_data.show()
 
+# 新商品リストを読み込み
+new_release_schema = StructType(new_release_items_fields())
+new_release_dir = 's3://new-release-items/'
+sdf_new_release_items = spark.read.csv(new_release_dir, header=True, encoding='utf-8', schema=new_release_schema)
+
+# item_master
 item_schema = StructType(item_fields())
 item_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/item-master/'
 sdf_item_master = spark.read.csv(item_dir, header=False, encoding='utf-8', schema=item_schema)
 # sdf_item_master.show()
 
-sales_start_schema = StructType(stales_start_day_fields())
-sales_start_dir = 's3://sales-start-day/'
-sdf_sales_start_day = spark.read.csv(sales_start_dir, header=True, encoding='utf-8', schema=sales_start_schema)
-
-
 print("=====================================")
 print("exec precess")
 print("=====================================")
 # ==============================
-# 販売がある商品コード一覧を作成
-# create a list of itmcd with sales
-# ==============================
-# 終了日をセット(pysparkのfunctionを使用)
-# 基準日に月を加算し、対象付きの最終日付をセット
-sdf_parameter_add = sdf_parameter.select(
-    func.add_months(sdf_parameter.reference_date, int(param_month_later)).alias('end_date'),
-)
-
-# sdf_parameter_add.show()
-
-start_date = param_reference_date
-# print(start_date)
-end_date = sdf_parameter_add.first()['end_date']
-# print(end_date)
-
-# ==============================
-# 指定期間で、販売がある店舗・商品コード一覧を作成
-# create a list of itmcd with sales
-# ==============================
-sdf_sales_shop_itmcd = sdf_journal_filter_data.filter(
-    (sdf_journal_filter_data.ymd >= start_date)
-    & (sdf_journal_filter_data.ymd < end_date)
-    & (sdf_journal_filter_data.qty > 0)
-).select('shop', 'itmcd').distinct()
-
-# 出力
-out_gdf_sales_itmcd_start_ymd = s3_write_spark_dataframe_single_file(
-    sdf_sales_shop_itmcd,
-    's3://sales-shop-itmcd'
-    )
-
-# ==============================
-# 指定期間以降で販売された（だろう）商品と販売開始日
+# journalの期間を、販売開始想定期間以降に絞り込み
 # =============================
 # 開始日・終了日をセット(pysparkのfunctionを使用)
 sdf_parameter_add = sdf_parameter.select(
     func.add_months(sdf_parameter.reference_date, -int(param_month_ago)).alias('sales_start_date'),
 )
-
 sales_start_date = sdf_parameter_add.first()['sales_start_date']
 # print(sales_start_date)
 
-sdf_sales_start_day_filter = sdf_sales_start_day.filter(
-    sdf_sales_start_day.sales_start_day >= sales_start_date
+sdf_journal_filter_date_add = sdf_journal_filter_data.filter(
+    sdf_journal_filter_data.ymd >= sales_start_date
 )
+# sdf_journal_filter_date_add.show()
 
-# 販売がある商品に、新商品（想定）の商品で絞り込んで販売開始日を付与する
-sdf_new_release_items = sdf_sales_shop_itmcd.join(
-    sdf_sales_start_day_filter,
+
+# ==============================
+# 店舗・商品別販売金額のABC分析
+# ==============================
+# 店舗・分類の全合計数
+sdf_shop_cate_amount_all = sdf_journal_filter_date_add.groupBy(
+    'shop','cate1','cate2','cate3'
+).agg(
+    func.sum('amt').alias('shop_cate_amount_all')
+    )
+
+# sdf_sales_amount_all.show()
+
+# 商品別販売数の合計
+sdf_item_sum_amount = sdf_journal_filter_date_add.groupBy(
+            'shop', 'cate1', 'cate2', 'cate3', 'itmcd'
+        ).agg(
+            func.sum('amt').alias('item_sum_amount')
+        ).sort(
+            func.desc('item_sum_amount')
+        )
+
+# sdf_item_sum_amount.show()
+
+# 構成比作成
+# df_sum_amount_ratio = df_sum_amount.withColumn(
+#     'ratio', df_sum_amount.sum_amount / amount_all * 100)
+# df_sum_amount_ratio.show()
+sdf_sum_amount_ratio = sdf_item_sum_amount.alias('df1').join(
+    sdf_shop_cate_amount_all.alias('df2'),
     [
-        sdf_sales_shop_itmcd.shop == sdf_sales_start_day_filter.shop,
-        sdf_sales_shop_itmcd.itmcd == sdf_sales_start_day_filter.itmcd
+        col('df1.shop') == col('df2.shop'),
+        col('df1.cate1') == col('df2.cate1'),
+        col('df1.cate2') == col('df2.cate2'),
+        col('df1.cate3') == col('df2.cate3')
     ],
     'inner'
 ).select(
-    sdf_sales_shop_itmcd['*'],
-    sdf_sales_start_day_filter.sales_start_day
+    'df1.*',
+    'df2.shop_cate_amount_all'
+).withColumn(
+    'ratio', col('df1.item_sum_amount') / col('df2.shop_cate_amount_all') * 100
 )
 
-# sdf_new_release_items.show()
+# sdf_sum_amount_ratio.show()
 
-# 商品マスタの情報を付与する
-sdf_new_release_items_join_master = sdf_new_release_items.join(
-    sdf_item_master,
-    sdf_new_release_items.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
-    "inner"
-).select(
-    sdf_new_release_items.shop,
-    sdf_item_master.cate1,
-    sdf_item_master.cate2,
-    sdf_item_master.cate3,
-    sdf_item_master.cate4,
-    sdf_item_master.cate5,
-    sdf_new_release_items.itmcd,
-    sdf_item_master.itmnm,
-    sdf_new_release_items.sales_start_day,
+# 構成比の累計作成
+sdf_cumsum_ratio = sdf_sum_amount_ratio.withColumn(
+    'cumsum_ratio',
+    func.sum(
+        sdf_sum_amount_ratio.ratio
+        ).over(
+            Window.partitionBy(
+                'shop', 'cate1', 'cate2', 'cate3'
+                ).orderBy(
+                    'shop', 'cate1', 'cate2', 'cate3', func.desc('item_sum_amount')
+                    )
+    ))
+# sdf_cumsum_ratio.show(200)
+
+# ABCランク付け
+# sdf_amount_abc : 
+#   shop, cate1, cate2, cate3, cat4, itmcd, item_sum_amount, shop_cate_amount_all, ratio, cumsum_ratio, abc_rank 
+sdf_amount_abc = sdf_cumsum_ratio.withColumn(
+    'abc_rank',
+    func.when(
+        sdf_cumsum_ratio.cumsum_ratio <= param_abc_s, 'S'
+    ).when(
+        (sdf_cumsum_ratio.cumsum_ratio > param_abc_s) & (sdf_cumsum_ratio.cumsum_ratio <= param_abc_a), 'A'
+    ).when(
+        (sdf_cumsum_ratio.cumsum_ratio > param_abc_a) & (sdf_cumsum_ratio.cumsum_ratio <= param_abc_b), 'B'
+    ).when(
+        (sdf_cumsum_ratio.cumsum_ratio > param_abc_b) & (sdf_cumsum_ratio.cumsum_ratio <= param_abc_c), 'C'
+    ).otherwise('D')
 )
 
-# 出力
-out_gdf_sales_itmcd_start_ymd = s3_write_spark_dataframe_single_file(
-    sdf_new_release_items_join_master,
-    's3://new-release-items'
+# sdf_amount_abc.show(200)
+
+# >>確認用
+# ランクごとの商品数を表示
+sdf_rank_item_count = sdf_amount_abc.groupBy(
+    'shop', 'cate1', 'cate2', 'cate3', 'abc_rank'
+).count().orderBy(
+    'shop', 'cate1', 'cate2', 'cate3', 'abc_rank'
+)
+# sdf_rank_item_count.show()
+# <<確認用
+
+out_gdf_popular_amount_abc = s3_write_spark_dataframe_single_file(
+    sdf_amount_abc,
+    's3://popular-amount-abc'
     )
 
 print("=====================================")
 print("job commit")
 print("=====================================")
 job.commit()
+

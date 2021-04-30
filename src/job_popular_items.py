@@ -9,6 +9,7 @@ from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql import functions as func
 from pyspark.sql.types import StructField, StructType, StringType, IntegerType, DateType
+from pyspark.sql.types import LongType, DoubleType
 from pyspark.sql.window import Window
 from pyspark.sql import DataFrame
 from pyspark.sql import SparkSession
@@ -24,23 +25,33 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 
+def s3_write_spark_dataframe_single_file(spark_data_frame, s3_path):
+    """ S3にファイルを出力する
+    args:
+        spark_data_frame: spark形式のDataFrame
+        s3_path: 出力先S3のフルパス
+    return:
+    """
+    # 複数ファイル出力を一つにする
+    sdf_single = spark_data_frame.coalesce(1)
+    # PySparkのDataFrameをGlueのDataFrameに変換
+    gdf_single = DynamicFrame.fromDF(sdf_single, glueContext, 'gdf_single')
+
+    # S3に出力
+    s3_write_dynamic_frame = glueContext.write_dynamic_frame.from_options(
+        frame=gdf_single,
+        connection_type='s3',
+        connection_options={
+            'path': s3_path
+        },
+        format='csv',
+        transformation_ctx = "s3_write_dynamic_frame ",
+    )
+    return s3_write_dynamic_frame
+
 print("=====================================")
 print("Start S3 DataRead")
 print("=====================================")
-#######
-# 本番ではGlueテーブルから読み込む
-# ↓
-# .toDF() でSparkDataFrameへ変換を想定(データ型はGlueのテーブル型になってると思う)
-#
-# GlueテーブルからDataFrameの作成例：
-# DataSource0 = glueContext.create_dynamic_frame.from_catalog(
-#     database = "glue-sample-db",
-#     table_name = "sns_sales_receipt_data",
-#     transformation_ctx = "DataSource0"
-#     )
-#
-#######
-
 def journal_fields():
     fields_list = [
         StructField("cpcd2", IntegerType(), True),
@@ -105,7 +116,46 @@ def item_fields():
 
     return fields_list
 
-# SparkDataFrame形式でS3からファイルを読み込んでしまう
+def stales_start_day_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("sales_start_day", DateType(), True),
+    ]
+
+    return fields_list
+
+def new_release_items_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("cate1", StringType(), True),
+        StructField("cate2", StringType(), True),
+        StructField("cate3", StringType(), True),
+        StructField("cate4", StringType(), True),
+        StructField("cate5", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("itmnm", StringType(), True),
+        StructField("sales_start_day", DateType(), True),
+    ]
+
+    return fields_list
+
+def popular_amount_abc_fields():
+    fields_list = [
+        StructField("shop", StringType(), True),
+        StructField("cate1", StringType(), True),
+        StructField("cate2", StringType(), True),
+        StructField("cate3", StringType(), True),
+        StructField("itmcd", StringType(), True),
+        StructField("item_sum_amount", LongType(), True),
+        StructField("shop_cate_amount_all", LongType(), True),
+        StructField("ratio", DoubleType(), True),
+        StructField("cumsum_ratio", DoubleType(), True),
+        StructField("abc_rank", StringType(), True),
+    ]
+
+    return fields_list
+
 
 # ==============================
 # parameterファイル読み込み
@@ -120,95 +170,61 @@ param_reference_date = sdf_parameter.first()['reference_date']
 param_month_ago = sdf_parameter.first()['month_ago']
 param_month_later = sdf_parameter.first()['month_later']
 
+param_abc_s = sdf_parameter.first()['abc_s']
+param_abc_a = sdf_parameter.first()['abc_a']
+param_abc_b = sdf_parameter.first()['abc_b']
+param_abc_c = sdf_parameter.first()['abc_c']
+
 # ==============================
 # データファイル読み込み
 # ==============================
-# journalファイル読み込み
-journal_schema = StructType(journal_fields())
-journal_dir = "s3://mekiki-data-bucket/mekiki-data/input-output/journal-data"
-sdf_journal_data = spark.read.csv(journal_dir, header=False, encoding='utf-8', schema=journal_schema)
+# popular_amount_abc
+amount_abc_schema = StructType(popular_amount_abc_fields())
+amount_abc_dir = 's3://popular-amount-abc/'
+sdf_popular_amount_abc = spark.read.csv(amount_abc_dir, header=True, encoding='utf-8', schema=amount_abc_schema)
 
-# item読み込み
+
+# 新商品リストを読み込み
+new_release_schema = StructType(new_release_items_fields())
+new_release_dir = 's3://new-release-items/'
+sdf_new_release_items = spark.read.csv(new_release_dir, header=True, encoding='utf-8', schema=new_release_schema)
+
+# item_master
 item_schema = StructType(item_fields())
 item_dir = 's3://mekiki-data-bucket/mekiki-data/input-output/item-master/'
 sdf_item_master = spark.read.csv(item_dir, header=False, encoding='utf-8', schema=item_schema)
+# sdf_item_master.show()
 
 print("=====================================")
-print("filter category")
+print("exec precess")
 print("=====================================")
-# journalにitem_masterをjoin
-# 特定フィルターにしぼる
-sdf_journal_filter_data = sdf_journal_data.join(
-    sdf_item_master,
-    sdf_journal_data.itmcd == func.lpad(sdf_item_master.itmcd, 18, '0'),
+# ==============================
+# journalの期間を、販売開始想定期間以降に絞り込み
+# =============================
+# Sランク商品のみ
+sdf_amount_rank_a = sdf_popular_amount_abc.filter(sdf_popular_amount_abc.abc_rank == 'S')
+# sdf_amount_rank_a.show(100)
+
+# 新商品リストからAランク商品のみに絞り込む
+sdf_popular_items = sdf_new_release_items_rank_a = sdf_new_release_items.join(
+    sdf_amount_rank_a,
+    [
+        sdf_new_release_items.shop == sdf_amount_rank_a.shop,
+        sdf_new_release_items.itmcd == sdf_amount_rank_a.itmcd
+    ],
     'inner'
-).select(
-    sdf_journal_data.cpcd2,
-    sdf_journal_data.shop,
-    sdf_journal_data.ymd,
-    sdf_journal_data.hm,
-    sdf_journal_data.reg,
-    sdf_journal_data.num,
-    sdf_journal_data.seq,
-    sdf_journal_data.dtype,
-    sdf_journal_data.itmcd,
-    # >> item cate
-    sdf_item_master.cate1,
-    sdf_item_master.cate2,
-    sdf_item_master.cate3,
-    sdf_item_master.cate4,
-    sdf_item_master.cate5,
-    # << item cate
-    sdf_journal_data.qty,
-    sdf_journal_data.amt,
-    sdf_journal_data.prf,
-    sdf_journal_data.type,
-    sdf_journal_data.pay,
-    sdf_journal_data.cadid,
-    sdf_journal_data.cid,
-    sdf_journal_data.cstid,
-    sdf_journal_data.itmid,
-    sdf_journal_data.bgnno,
-    sdf_journal_data.bgntp,
-    sdf_journal_data.bgnid,
-    sdf_journal_data.itmcd_org,
-    sdf_journal_data.opt01,
-    sdf_journal_data.opt02,
-    sdf_journal_data.opt03,
-    sdf_journal_data.opt04,
-    sdf_journal_data.opt05,
-    sdf_journal_data.num_org,
-).filter(
-    (sdf_item_master.cate1 == param_cate1)
-    & (sdf_item_master.cate2 == param_cate2)
-    & (sdf_item_master.cate3 == param_cate3)
-)
+).select(sdf_new_release_items['*'])
 
-print("=====================================")
-print("Start Write S3")
-print("=====================================")
+# sdf_popular_items.show()
 
-# 複数ファイル出力を一つにする場合
-sdf_journal_filter_data = sdf_journal_filter_data.coalesce(1)
-
-# sdf_journal_filter_data.show()
-
-# PySparkのDataFrameをGlueのDataFrameに変換
-gdf_write_data = DynamicFrame.fromDF(sdf_journal_filter_data, glueContext, 'gdf_journal_filter_data')
-
-# s3出力（なぜかバケット直下しかうまくいかない。なぜだ・・・）
-# 本番では他ディレクトリ配下に作成可能
-out_gdf = glueContext.write_dynamic_frame.from_options(
-    frame=gdf_write_data,
-    connection_type='s3',
-    connection_options={
-        'path': 's3://journal-filter-data'
-    },
-    format='csv',
-    transformation_ctx = "out_gdf",
-)
+# 出力
+out_gdf_popular_items = s3_write_spark_dataframe_single_file(
+    sdf_popular_items,
+    's3://popular-items'
+    )
 
 print("=====================================")
 print("job commit")
 print("=====================================")
 job.commit()
+
